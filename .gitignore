@@ -1,0 +1,3 @@
+echo ".DS_Store" >> .gitignore
+echo "*.txt" >> .gitignore
+echo "*.db" >> .gitignore

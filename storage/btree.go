@@ -1,8 +1,10 @@
+// / file: storage/btree.go
 package storage
 
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"log"
 )
 
@@ -13,74 +15,56 @@ const (
 	OFFSET    = 2
 	KLEN      = 2
 	VLEN      = 2
-	KVHEADER  = 4 // keylen = 2, vallen = 2
+	KVHEADER  = 4
 	MAXKEYLEN = 1000
 	MAXVALLEN = 3000
 
-	// header
 	BNODE_NODE = 1
 	BNODE_LEAF = 2
 
-	// comparitions
-	CMP_GT = 3 // >
-	CMP_GE = 2 // >=
-	CMP_LT = 1 // <
-	CMP_LE = 0 // <=
+	CMP_GT = 3
+	CMP_GE = 2
+	CMP_LT = 1
+	CMP_LE = 0
 )
 
-// assert panics if the condition is false.
 func assert(condition bool) {
 	if !condition {
 		panic("assertion failed!")
 	}
 }
 
-// | type (2B) | nkeys (2B) | pointers | offsets | key-values |
-
 type BTree struct {
-	Root uint64 // pointer to the page
-
-	//callbacks
-	get func(uint64) []byte // get the page
-	new func([]byte) uint64 // allocate a new page
-	del func(uint64)        // delete a page
+	Root uint64
+	get  func(uint64) []byte
+	new  func([]byte) uint64
+	del  func(uint64)
 }
 
-// BIter is used to iterate though the leaf nodes
 type BIter struct {
-	tree  *BTree  // pointer to Btree
-	path  []BNode // slice of nodes that from root to leaf both inclusive
-	pos   []int32 // it indicates the index of child node
+	tree  *BTree
+	path  []BNode
+	pos   []int32
 	valid bool
 }
 
 func init() {
-	// size of largest possible node
 	node1max := HEADER + POINTER + OFFSET + (KVHEADER + MAXKEYLEN + MAXVALLEN)
-
-	// check if the max node fits in a page
 	if node1max > PAGE_SIZE {
 		log.Fatalln("size of node exceeds the size of page")
 	}
 }
 
-// BNode is just a raw slice of bytes.
 type BNode []byte
 
-// Hence allowing us to dump it directly to disk without serialization
-// format used to store bytes is LittleEndian
-
-// Used to determine if it is a leaf node or internal
 func (b BNode) btype() uint16 {
 	return binary.LittleEndian.Uint16(b[0:2])
 }
 
-// Returns number of keys in the node
 func (b BNode) nkeys() uint16 {
 	return binary.LittleEndian.Uint16(b[2:4])
 }
 
-// getPtr extracts the child pointer at the specific index
 func (b BNode) getptr(idx uint16) uint64 {
 	if idx >= b.nkeys() {
 		log.Fatalf("Out of bounds whilst fetching pointer, index: %d, nkeys: %d", idx, b.nkeys())
@@ -89,32 +73,29 @@ func (b BNode) getptr(idx uint16) uint64 {
 	return binary.LittleEndian.Uint64(b[sbyte:])
 }
 
-// setptr set the poiter at a given index to the specified value
 func (b BNode) setptr(idx uint16, ptr uint64) {
 	if idx >= b.nkeys() {
-		log.Fatalf("Pointer set out of bounds , index: %d, nkeys: %d", idx, b.nkeys())
+		log.Fatalf("Pointer set out of bounds, index: %d, nkeys: %d", idx, b.nkeys())
 	}
 	sbyte := HEADER + (idx * 8)
 	binary.LittleEndian.PutUint64(b[sbyte:], ptr)
 }
 
-// offsetPos calculates where the offset for a given KV pair is stored
 func (b BNode) offsetPos(idx uint16) uint16 {
 	if idx > b.nkeys() {
 		log.Fatalf("out of bounds, idx: %d, nkeys: %d", idx, b.nkeys())
 	}
-
 	sbyte := HEADER + (b.nkeys() * POINTER) + ((idx - 1) * OFFSET)
 	return sbyte
 }
 
-// getOffset returns offset of a kv parir relative to the 1st kv pair
 func (b BNode) getOffset(idx uint16) uint16 {
 	if idx == 0 {
-		return 0 // first offset always starts at 0
+		return 0
 	}
 	return binary.LittleEndian.Uint16(b[b.offsetPos(idx):])
 }
+
 func (b BNode) setOffset(idx uint16, val uint16) {
 	if idx > b.nkeys() {
 		log.Fatalf("out of bounds setting offset, idx: %d, nkeys: %d", idx, b.nkeys())
@@ -123,31 +104,21 @@ func (b BNode) setOffset(idx uint16, val uint16) {
 	binary.LittleEndian.PutUint16(b[sbyte:], val)
 }
 
-// setHeader configures the first 4 bytes of the node
 func (node BNode) setHeader(btype uint16, nkeys uint16) {
 	binary.LittleEndian.PutUint16(node[0:2], btype)
 	binary.LittleEndian.PutUint16(node[2:4], nkeys)
-
 }
 
-//| klen (2B) | vlen (2B) | key | val |
-
-// kvPos calculates the exact byte position of the KV pair within the node
 func (node BNode) kvPos(idx uint16) uint16 {
-	// Skip header, pointers, and the offset list itself, then add the specific KV offset
 	return HEADER + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
 }
 
-// getKey extracts the key byte slice
 func (node BNode) getKey(idx uint16) []byte {
 	pos := node.kvPos(idx)
 	klen := binary.LittleEndian.Uint16(node[pos:])
-	afterHeader := node[pos+4:]    // Step 1: Skip the header
-	exactKey := afterHeader[:klen] // Step 2: Grab only the key's letters
-	return exactKey                // can be written as node[pos+4:][:klen]
+	return node[pos+4:][:klen]
 }
 
-// getVal extracts the value byte slice
 func (node BNode) getVal(idx uint16) []byte {
 	pos := node.kvPos(idx)
 	klen := binary.LittleEndian.Uint16(node[pos+0:])
@@ -155,73 +126,50 @@ func (node BNode) getVal(idx uint16) []byte {
 	return node[pos+4+klen:][:vlen]
 }
 
-// nbytes conveniently returns the total size of the node in bytes by looking at the end of the very last KV pair
 func (node BNode) nbytes() uint16 {
 	return node.kvPos(node.nkeys())
 }
 
 func nodeLookupLE(node BNode, key []byte) uint16 {
-	//nkeys := node.nkeys()// last key
 	low := uint16(1)
 	high := node.nkeys()
-	found := uint16(0) // first key
+	found := uint16(0)
 
-	// The first key is a copy from the parent node, thus it's always less than or equal to the key.
-	// Binary search...
 	for low < high {
-
 		mid := low + (high-low)/2
-
-		// Compare
 		cmp := bytes.Compare(node.getKey(mid), key)
 
 		if cmp == 0 {
-			// Exact match found
 			found = mid
 			break
 		} else if cmp < 0 {
-			// Node key is smaller than target
 			found = mid
 			low = mid + 1
 		} else {
-			// Node key is larger than target
-			high = mid // prevents uint16 underflow
+			high = mid
 		}
 	}
 	return found
 }
 
-// nodeAppendKV copies a new kv pair into a specified position of a new node
 func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
-	// set ptr
 	new.setptr(idx, ptr)
-
-	// set kv
 	pos := new.kvPos(idx)
 
-	// set kv headers
 	binary.LittleEndian.PutUint16(new[pos+0:], uint16(len(key)))
 	binary.LittleEndian.PutUint16(new[pos+2:], uint16(len(val)))
 
-	// set kv data
 	copy(new[pos+KVHEADER:], key)
 	copy(new[pos+KVHEADER+uint16(len(key)):], val)
 
-	// the offset of the next key
 	new.setOffset(idx+1, new.getOffset(idx)+KVHEADER+uint16(len(key)+len(val)))
 }
 
-// Helper function to find exactly where the KV data starts
 func (node BNode) kvStart() uint16 {
 	return HEADER + POINTER*node.nkeys() + OFFSET*node.nkeys()
 }
 
-// nodeAppendRange copies multiple KVs into the position from the old node
-// we dont call nodeAppendKV 'n' times as it forces the computer to do a massive amount of unnecessary work which may lead to a performance tank.
-func nodeAppendRange(
-	new BNode, old BNode,
-	dstNew uint16, srcOld uint16, n uint16,
-) {
+func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
 	if dstNew+n > new.nkeys() {
 		log.Fatalf("out of bounds new node, idx: %d, nkeys: %d", dstNew+n, new.nkeys())
 	}
@@ -232,13 +180,10 @@ func nodeAppendRange(
 		return
 	}
 
-	// 1. Copy Pointers
 	for i := range n {
-
 		new.setptr(dstNew+uint16(i), uint64(old.getptr(srcOld+uint16(i))))
 	}
 
-	// 2. Calculate and Set Offsets
 	dstBegin := new.getOffset(dstNew)
 	srcBegin := old.getOffset(srcOld)
 	shiftDistance := dstBegin - srcBegin
@@ -248,7 +193,6 @@ func nodeAppendRange(
 		new.setOffset(dstNew+i, oldOffset+shiftDistance)
 	}
 
-	// 3. Copy Raw KV Data
 	oldStart := old.kvStart()
 	begin := old.getOffset(srcOld) + oldStart
 	end := old.getOffset(srcOld+n) + oldStart
@@ -259,130 +203,419 @@ func nodeAppendRange(
 	copy(new[newBegin:], old[begin:end])
 }
 
-// leafInsert adds a new key to a leaf node by copying the old data into a new node
-func leafInsert(
-	new BNode, old BNode, idx uint16,
-	key []byte, val []byte,
-) {
-	new.setHeader(BNODE_LEAF, old.nkeys()+1) // setup the header
+func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(BNODE_LEAF, old.nkeys()+1)
 	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendKV(new, idx, 0, key, val)
 	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
 }
 
-func nodeReplaceKidN(
-	tree *BTree, new BNode, old BNode, idx uint16,
-	kids ...BNode,
-) {
-	// number of child nodes
-	inc := uint16(len(kids))
+func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(old.btype(), old.nkeys())
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx+1, old.nkeys()-(idx+1))
+}
 
-	//The new node will have 'inc' new keys, minus the 1 old key we are replacing
+func leafDelete(new BNode, old BNode, idx uint16) {
+	new.setHeader(BNODE_LEAF, old.nkeys()-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendRange(new, old, idx, idx+1, old.nkeys()-idx-1)
+}
+
+func nodeReplaceKidN(tree *BTree, new BNode, old BNode, idx uint16, kids ...BNode) {
+	inc := uint16(len(kids))
 	new.setHeader(BNODE_NODE, old.nkeys()+inc-1)
 
-	// append kv's from 0 to given index
 	nodeAppendRange(new, old, 0, 0, idx)
 
-	// append new kv or multiple keys at give index
-	for i, node := range kids {
-		nodeAppendKV(new, idx+uint16(i), tree.new(node), node.getKey(0), nil)
-		// ^position    ^pointer        ^key             ^val
+	for i, kidNode := range kids {
+		nodeAppendKV(new, idx+uint16(i), tree.new(kidNode), kidNode.getKey(0), nil)
 	}
-	// append kv's from index + 1 to all of the indexes
 	nodeAppendRange(new, old, idx+inc, idx+1, old.nkeys()-(idx+1))
 }
 
-// Worst-case split: Inserting a max-size KV (1000B key + 3000B val) 
-// into a nearly full node can force it to split into 3 separate nodes 
-// to respect the 4KB page limit [cite: 790-792].
-// nodeSplit2 splits an oversized node into 2. 
-// Returns the median idx.
-func nodeSplit2(left BNode, right BNode, old BNode)  {
-	// 1. BASE CASE
-    // If the node isn't actually oversized (i.e. it fits in 1 page), then we can just copy it over to the left node and return.
-    if old.nbytes() <= PAGE_SIZE {
-        return 
-    }
-
-    var idx uint16
-
-	// 2. EXTREME OVERSIZE SCENARIO (> 8192 bytes if your page is 4096)
-    if old.nbytes() > 2*PAGE_SIZE {
-        idx = old.nkeys()											// Start at the very end of the items
-        size := uint16(HEADER)										// Start counting bytes (every node needs a header)
-        
-        posRight := old.kvPos(idx)									// Find the exact byte where the very last item ends
-        
-		// Loop BACKWARDS from the end of the node
-        for size < PAGE_SIZE && idx > 0 {
-            posLeft := old.kvPos(idx - 1)							// Find where this specific item begins
-			// Calculate how much space this item takes up:
-            // (End Byte - Start Byte) + 8 bytes for the Pointer + 2 bytes for the Offset
-            size += (posRight - posLeft) + POINTER + OFFSET
-
-            posRight = posLeft 										// Move our "end" marker backwards for the next loop
-            idx--													// Move to the previous item
-        }
-		// Because the loop stops *after* it goes one step too far, we add 1 back to idx to get the correct cut point.
-        idx++
-
-		// 3. NORMAL OVERSIZE SCENARIO (between 4096 and 8192 bytes)
-    } else {
-        idx = 0
-        halfSize := old.nbytes() / 2	// Find the exact halfway point of the memory
-        size := uint16(HEADER)       	// Start counting bytes from the header
-        
-        posLeft := old.kvPos(idx)		// Find where the very first item begins
-
-   			// Loop FORWARDS from the beginning of the node
-        for size < halfSize && idx < old.nkeys() {
-            posRight := old.kvPos(idx + 1)// Find where this specific item ends
-
-			// Accumulate the size of the item just like we did above
-            size += (posRight - posLeft) + POINTER + OFFSET
-
-            posLeft = posRight // Move our "start" marker forwards for the next loop
-            idx++              // Move to the next item
-        }
-    }
-
-  
-    // 4. EXECUTE THE SPLIT
-    // Now that we know exactly where the cut happens (idx), we configure the new nodes.
-
-    left.setHeader(old.btype(), idx)               // Left node gets 'idx' number of items
-    right.setHeader(old.btype(), old.nkeys()-idx)  // Right node gets whatever is leftover
-
-    // 5. BULK COPY THE DATA
-
-    // Paste the first half into the left node
-    nodeAppendRange(left, old, 0, 0, idx)
-    // Paste the second half into the right node
-    nodeAppendRange(right, old, 0, idx, old.nkeys()-idx)
-    
+func nodeReplace2Kid(new BNode, old BNode, idx uint16, mergedPtr uint64, key []byte) {
+	new.setHeader(old.btype(), old.nkeys()-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, mergedPtr, key, nil)
+	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+2))
 }
 
-// nodeSplit3 splits a node if it's too big. The results are 1 to 3 nodes.
-func nodeSplit3(old BNode) (uint16, [5]BNode) {
+func nodeMerge(new, left, right BNode) {
+	new.setHeader(left.btype(), left.nkeys()+right.nkeys())
+	nodeAppendRange(new, left, 0, 0, left.nkeys())
+	nodeAppendRange(new, right, left.nkeys(), 0, right.nkeys())
+}
+
+func nodeSplit2(left BNode, right BNode, old BNode) uint16 {
+	if old.nbytes() <= PAGE_SIZE {
+		return 0
+	}
+
+	if old.nbytes() > 2*PAGE_SIZE {
+		idx := old.nkeys()
+		size := uint16(HEADER)
+
+		for size < PAGE_SIZE && idx > 0 {
+			posLeft := old.kvPos(idx - 1)
+			posRight := old.kvPos(idx)
+			size += (posRight - posLeft) + POINTER + OFFSET
+			idx--
+		}
+		idx++
+
+		left.setHeader(old.btype(), idx)
+		right.setHeader(old.btype(), old.nkeys()-idx)
+
+		nodeAppendRange(left, old, 0, 0, idx)
+		nodeAppendRange(right, old, 0, idx, old.nkeys()-idx)
+		return idx
+	} else {
+		idx := uint16(0)
+		halfSize := old.nbytes() / 2
+		size := uint16(HEADER)
+
+		for size < halfSize && idx < old.nkeys() {
+			posRight := old.kvPos(idx + 1)
+			posLeft := old.kvPos(idx)
+			size += (posRight - posLeft) + POINTER + OFFSET
+			idx++
+		}
+
+		left.setHeader(old.btype(), idx)
+		right.setHeader(old.btype(), old.nkeys()-idx)
+
+		nodeAppendRange(left, old, 0, 0, idx)
+		nodeAppendRange(right, old, 0, idx, old.nkeys()-idx)
+		return idx
+	}
+}
+
+func nodeSplit3(old BNode) (uint16, [3]BNode) {
 	if old.nbytes() <= PAGE_SIZE {
 		old = old[:PAGE_SIZE]
-		return 1, [5]BNode{old} // Not split, fits perfectly
+		return 1, [3]BNode{old}
 	}
-    
-	left := BNode(make([]byte, 2*PAGE_SIZE)) // Might be split again later
+
+	left := BNode(make([]byte, 2*PAGE_SIZE))
 	right := BNode(make([]byte, PAGE_SIZE))
-	nodeSplit2(left, right, old)
-    
+	_ = nodeSplit2(left, right, old)
+
 	if left.nbytes() <= PAGE_SIZE {
 		left = left[:PAGE_SIZE]
-		return 2, [5]BNode{left, right} // Split into 2 nodes
+		return 2, [3]BNode{left, right}
 	}
-    
-    // If the left node is STILL too big, split it one more time!
+
 	leftleft := BNode(make([]byte, PAGE_SIZE))
 	middle := BNode(make([]byte, PAGE_SIZE))
-	nodeSplit2(leftleft, middle, left)
+	_ = nodeSplit2(leftleft, middle, left)
 	assert(leftleft.nbytes() <= PAGE_SIZE)
-    
-	return 3, [5]BNode{leftleft, middle, right} // Split into 3 nodes
+
+	return 3, [3]BNode{leftleft, middle, right}
+}
+
+func shouldMerge(tree *BTree, node BNode, idx uint16, updated BNode) (int, BNode) {
+	if updated.nbytes() > PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	if idx > 0 {
+		leftSib := BNode(tree.get(node.getptr(idx - 1)))
+		merged := leftSib.nbytes() + updated.nbytes() - HEADER
+		if merged <= PAGE_SIZE {
+			return -1, leftSib
+		}
+	}
+
+	if idx+1 < node.nkeys() {
+		rightSib := BNode(tree.get(node.getptr(idx + 1)))
+		merged := rightSib.nbytes() + updated.nbytes() - HEADER
+		if merged <= PAGE_SIZE {
+			return 1, rightSib
+		}
+	}
+
+	return 0, BNode{}
+}
+
+func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
+	new := BNode(make([]byte, 2*PAGE_SIZE))
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		if bytes.Equal(key, node.getKey(idx)) {
+			leafUpdate(new, node, idx, key, val)
+		} else {
+			if cmp := bytes.Compare(key, node.getKey(0)); cmp < 0 && idx == 0 {
+				new.setHeader(BNODE_LEAF, node.nkeys()+1)
+				nodeAppendKV(new, 0, 0, key, val)
+				nodeAppendRange(new, node, 1, 0, node.nkeys())
+			} else {
+				leafInsert(new, node, idx+1, key, val)
+			}
+		}
+	case BNODE_NODE:
+		nodeInsert(tree, new, node, idx, key, val)
+	default:
+		log.Panicln("invalid node header(bad node)!")
+	}
+	return new
+}
+
+func nodeInsert(tree *BTree, new BNode, node BNode, idx uint16, key []byte, val []byte) {
+	kptr := node.getptr(idx)
+	knode := treeInsert(tree, tree.get(kptr), key, val)
+	nsplit, split := nodeSplit3(knode)
+	tree.del(kptr)
+	nodeReplaceKidN(tree, new, node, idx, split[:nsplit]...)
+}
+
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		if !bytes.Equal(key, node.getKey(idx)) {
+			return BNode{}
+		}
+		new := BNode(make([]byte, PAGE_SIZE))
+		leafDelete(new, node, idx)
+		return new
+	case BNODE_NODE:
+		return nodeDelete(tree, node, idx, key)
+	default:
+		log.Panicln("invalid node header(bad node)!")
+	}
+	return BNode{}
+}
+
+func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+	kptr := node.getptr(idx)
+	updated := treeDelete(tree, tree.get(kptr), key)
+	if len(updated) == 0 {
+		return BNode{}
+	}
+
+	new := BNode(make([]byte, PAGE_SIZE))
+	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
+	switch {
+	case mergeDir < 0:
+		merged := BNode(make([]byte, PAGE_SIZE))
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getptr(idx - 1))
+		nodeReplace2Kid(new, node, idx-1, tree.new(merged), merged.getKey(0))
+	case mergeDir > 0:
+		merged := BNode(make([]byte, PAGE_SIZE))
+		nodeMerge(merged, updated, sibling)
+		tree.del(node.getptr(idx + 1))
+		nodeReplace2Kid(new, node, idx, tree.new(merged), merged.getKey(0))
+	case mergeDir == 0 && updated.nkeys() == 0:
+		if node.nkeys() == 1 && idx == 0 {
+			new.setHeader(BNODE_NODE, 0)
+		}
+	case mergeDir == 0 && updated.nkeys() > 0:
+		nodeReplaceKidN(tree, new, node, idx, updated)
+	}
+	return new
+}
+
+func (t BTree) getVal(node BNode, key []byte) ([]byte, error) {
+	switch node.btype() {
+	case BNODE_LEAF:
+		idx := nodeLookupLE(node, key)
+		if bytes.Equal(node.getKey(idx), key) {
+			return node.getVal(idx), nil
+		}
+		return nil, fmt.Errorf("key not present %v", key)
+
+	case BNODE_NODE:
+		idx := nodeLookupLE(node, key)
+		cptr := node.getptr(idx)
+		cnode := BNode(t.get(cptr))
+		return t.getVal(cnode, key)
+	}
+	return nil, fmt.Errorf("invalid node header")
+}
+
+func (t *BTree) GetVal(key []byte) ([]byte, error) {
+	if t.Root == 0 {
+		return nil, fmt.Errorf("btree is empty")
+	}
+	return t.getVal(t.get(t.Root), key)
+}
+
+func (t *BTree) Insert(key, val []byte) {
+	if t.Root == 0 {
+		new := BNode(make([]byte, PAGE_SIZE))
+		new.setHeader(BNODE_LEAF, 2)
+		nodeAppendKV(new, 0, 0, nil, nil)
+		nodeAppendKV(new, 1, 0, key, val)
+		t.Root = t.new(new)
+		return
+	}
+
+	node := treeInsert(t, t.get(t.Root), key, val)
+	nsplit, split := nodeSplit3(node)
+
+	rootnode := BNode(t.get(t.Root))
+	if rootnode.btype() != BNODE_LEAF {
+		t.del(t.Root)
+	}
+
+	if nsplit > 1 {
+		newRoot := BNode(make([]byte, PAGE_SIZE))
+		newRoot.setHeader(BNODE_NODE, nsplit)
+		for i := 0; i < int(nsplit); i++ {
+			childNode := split[i]
+			if rootnode.btype() == BNODE_LEAF && i == 0 {
+				modChildNode := BNode(make([]byte, PAGE_SIZE))
+				modChildNode.setHeader(childNode.btype(), childNode.nkeys()-1)
+				nodeAppendRange(modChildNode, childNode, 0, 1, childNode.nkeys()-1)
+				childNode = modChildNode
+			}
+			ptr := t.new(childNode)
+			childKey := childNode.getKey(0)
+			nodeAppendKV(newRoot, uint16(i), ptr, childKey, nil)
+		}
+		t.Root = t.new(newRoot)
+	} else {
+		t.Root = t.new(split[0])
+	}
+}
+
+func (tree *BTree) Delete(key []byte) bool {
+	if tree.Root == 0 {
+		log.Panicln("root node is empty")
+		return false
+	}
+
+	updatedNode := treeDelete(tree, BNode(tree.get(tree.Root)), key)
+	if len(updatedNode) == 0 {
+		return false
+	}
+
+	tree.del(tree.Root)
+
+	if updatedNode.btype() == BNODE_NODE && updatedNode.nkeys() == 1 {
+		tree.Root = updatedNode.getptr(0)
+	} else {
+		tree.Root = tree.new(updatedNode)
+	}
+	return true
+}
+
+func (tree *BTree) SeekLE(key []byte) *BIter {
+	iter := &BIter{tree: tree, valid: true}
+	for ptr := tree.Root; ptr != 0; {
+		node := BNode(tree.get(ptr))
+		idx := nodeLookupLE(node, key)
+		iter.path = append(iter.path, node)
+		iter.pos = append(iter.pos, int32(idx))
+		ptr = node.getptr(idx)
+	}
+	return iter
+}
+
+func (i *BIter) Deref() ([]byte, []byte) {
+	if i.tree.Root == 0 || len(i.path) == 0 {
+		return nil, nil
+	}
+	node := i.path[len(i.pos)-1]
+	idx := i.pos[len(i.pos)-1]
+	key := node.getKey(uint16(idx))
+	val := node.getVal(uint16(idx))
+	return key, val
+}
+
+func (i *BIter) Valid() bool {
+	if !i.valid || i.tree.Root == 0 {
+		return false
+	}
+	node := i.path[len(i.pos)-1]
+	pos := i.pos[len(i.pos)-1]
+	if pos < 0 || uint16(pos) > node.nkeys()-1 {
+		return false
+	}
+	return true
+}
+
+func (i *BIter) LastNode() bool {
+	for p, node := range i.path {
+		nkeys := int32(node.nkeys())
+		if i.pos[p] != nkeys-1 {
+			return false
+		}
+	}
+	return true
+}
+
+func (i *BIter) StartNode() bool {
+	for p := range i.path {
+		if i.pos[p] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (i *BIter) Next() {
+	if i.LastNode() && i.valid {
+		i.valid = false
+		return
+	}
+	if i.StartNode() && !i.valid {
+		i.valid = true
+		return
+	}
+	iterNext(i, len(i.path)-1)
+}
+
+func (i *BIter) Prev() {
+	if i.StartNode() && i.valid {
+		i.valid = false
+		return
+	}
+	if i.LastNode() && !i.valid {
+		i.valid = true
+		return
+	}
+	iterPrev(i, len(i.path)-1)
+}
+
+func iterNext(iter *BIter, level int) {
+	if iter.pos[level]+1 < int32(iter.path[level].nkeys()) {
+		iter.pos[level]++
+	} else if level > 0 {
+		iterNext(iter, level-1)
+	} else {
+		iter.valid = false
+		return
+	}
+
+	if level+1 < len(iter.pos) {
+		node := iter.path[level]
+		knode := BNode(iter.tree.get(node.getptr(uint16(iter.pos[level]))))
+		iter.path[level+1] = knode
+		iter.pos[level+1] = 0
+	}
+}
+
+func iterPrev(iter *BIter, level int) {
+	if iter.pos[level] > 0 {
+		iter.pos[level]--
+	} else if level > 0 {
+		iterPrev(iter, level-1)
+	} else {
+		iter.valid = false
+		return
+	}
+
+	if level+1 < len(iter.pos) && iter.pos[len(iter.pos)-1] != -1 {
+		node := iter.path[level]
+		knode := BNode(iter.tree.get(node.getptr(uint16(iter.pos[level]))))
+		iter.path[level+1] = knode
+		iter.pos[level+1] = int32(knode.nkeys() - 1)
+	}
 }

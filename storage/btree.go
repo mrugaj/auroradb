@@ -1,4 +1,3 @@
-// / file: storage/btree.go
 package storage
 
 import (

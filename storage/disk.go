@@ -1,4 +1,3 @@
-// / file: storage/disk.go
 package storage
 
 import (

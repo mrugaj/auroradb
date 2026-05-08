@@ -1,4 +1,3 @@
-// / file: cmd/auroradb.go
 package main
 
 import (
